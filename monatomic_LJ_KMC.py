@@ -9,6 +9,7 @@ import numba as nb
 #from numba import jit,njit,types,optional
 import scipy
 
+from KolafaNezbeda import ULJ, PressureLJ, FreeEnergyLJ_res
 ###############################################################################
 #
 #                    Simulation code for KMC-NVT monatomic LJ
@@ -53,6 +54,7 @@ overlapping).
 chemical potential.
 
 """
+
 ###############################################################################
 #
 #            Simulation Variables (as few as possible)
@@ -60,16 +62,16 @@ chemical potential.
 ###############################################################################
 
 number_of_atoms = 500
-number_of_atom_types = 1# not actually used, this code is for monatomic LJ
+number_of_atom_types = 1 #not actually used, this code is for monatomic LJ
 atomType = "Ar"
 epsilon = 1.0
 sigma   = 1.0
-boxSize = 8.5
+boxSize = 8.4
 cutOff = boxSize / 2
-temperature = 2.0
-overLap = 100 / temperature # for numerical reasons, if the pair energy is over this, we cap it (we take exponentials)
-nEquilSteps = 10000
-outputInterval=100
+temperature = 1.0
+overLap = 50 / temperature # for numerical reasons, if the pair energy is over this, we cap it (we take exponentials)
+nEquilSteps = 100000
+outputInterval=2000
 
 ###############################################################################
 #
@@ -93,7 +95,7 @@ class System():
         self.temp = temp
         self.rCut = cutOff
         self.rCut_sq = cutOff ** 2
-        self.beta = 1 / temp
+        self.beta = 1.0 / temp
         self.positions = np.zeros((self.natoms,3),dtype=np.float_)
         self.velocities = None
         self.forces = None
@@ -101,18 +103,29 @@ class System():
     def GenerateRandomBox(self):
         self.positions = np.random.rand(self.natoms,3) * self.boxSize
      
-    def GetPressure(self):
-        self.pressure = 1/ self.beta / self.volume + 1 / 3 / self.volume * self.virial
+    def GetPressure(self,virial):
+        return self.rho / self.beta  + virial / ( 3.0 * self.volume )
+    
+    def PressureTailCorrection(self):
+        return  16.0 / 3.0 * np.pi * self.rho **2 * self.sig **3 * self.eps * ( (2.0/3.0)*(self.sig / self.rCut)**9 - (self.sig / self.rCut)**3 )
+    def EnergyTailCorrection(self):
+        return  8.0 / 3.0 * np.pi * self.rho * self.natoms * self.sig **3 * self.eps * ( (1.0/3.0)*(self.sig / self.rCut)**9 - (self.sig / self.rCut)**3 )
+    def ChemPotTailCorrection(self):
+        """ beta * mu_corr = 2 * u_corr """
+        return 16.0 / 3.0 * np.pi * self.rho * self.sig **3 * self.eps * ( (1.0/3.0)*(self.sig / self.rCut)**9 - (self.sig / self.rCut)**3 )
 
-#@staticmethod
+""" THis is outside class since Numba has issues with compiling methods """
 @nb.njit #(nb.int64,nb.float64[:],nb.float64,nb.float64,nb.float64[:,:],nb.float64[:,:], nb.float64,nb.float64, nb.float64)       
 def updateEnergies(part, r, box, r_cut_box_sq,energyMatrix, virialMatrix,
                    eps, sig, overlap_sq = 0.75):
     ri = r[part]
     rsq = 0.0
-    for index, rj in enumerate(r):
+    """Calculate chosen particle's potential energy with rest of system """
+    """Save the pairwise energies in a matrix, same with virial contribution"""
+    #for index, rj in enumerate(r):
+    for index in range(0,len(r) ):
         if index == part: continue
-        rij = ri - rj            # Separation vector
+        rij = ri - r[index] #rj            # Separation vector
         rij = rij - np.rint(rij / box ) * box # Mirror Image Seperation
 
         rsq = np.dot(rij,rij)  # Squared separation
@@ -123,18 +136,42 @@ def updateEnergies(part, r, box, r_cut_box_sq,energyMatrix, virialMatrix,
             sr2    = sig / rsq    # (sigma/rij)**2
             sr6  = sr2 ** 3
             sr12 = sr6 ** 2
-            pot  = 4 * eps * (sr12 - sr6)        # LJ pair potential (cut but not shifted)
-            vir  = pot + sr12                    # LJ pair virial
+            pot  = 4.0 * eps * (sr12 - sr6)        # LJ pair potential (cut but not shifted)
+            vir  = 24.0 * eps * (2.0 * sr12 - sr6)                    # LJ pair virial
             energyMatrix[part,index] = pot
             energyMatrix[index,part] = pot
             virialMatrix[part,index] = vir
             virialMatrix[index,part] = vir
+                            
     return energyMatrix, virialMatrix
+
+@nb.njit
+def calculateParticleMobilities(natoms,rwEnergies, beta):
+    
+    mobilities = np.zeros((natoms), dtype=np.float_)
+    
+    for i in range(natoms):
+        mobilities[i] = np.exp( beta * np.sum( rwEnergies[i,:]) )
+        
+    
+    return mobilities
+
+class KMCSample():
+    def __init__(self):
+        self.confWeight = 0.0
+        self.totalWeight = 0.0
+        self.configEnergy = 0.0
+        self.configVirial = 0.0
+        self.configPressure = 0.0
+        self.configChemicalPotential = 0.0
+        self.ensembleEnergy = 0.0
+        self.ensemblePressure = 0.0
+        self.ensembleChemicalPotential = 0.0
               
-class KMC_NVT():
+class KMC_NVT(KMCSample):
 
     def __init__(self, steps, overLap, system, runType):
-
+        KMCSample.__init__(self)
         self.nSteps = steps
         self.overLap = overLap
         self.system = system
@@ -143,6 +180,7 @@ class KMC_NVT():
         self.rwEnergies = np.zeros((self.system.natoms,self.system.natoms),dtype=np.float_)
         self.rwVirials = np.zeros((self.system.natoms,self.system.natoms),dtype=np.float_)
         self.totalMobility = 0.0
+        self.configWeight = 0.0
         print('Beginning {0:s} for {1:d} steps at {2:f} temperature'.format(
                 self.runType, self.nSteps, self.system.temp))
         self.OverCut()
@@ -158,11 +196,30 @@ class KMC_NVT():
             steps += 1
 
             self.UpdateMobilities()
+            self.mobilities[np.isnan(self.mobilities)] = 1e30 # a catch incase of overflow
             part = self.PickParticle()
             self.MoveParticle(part)
             self.UpdateEnergies(part)
-            if steps % outputInterval == 0: print('Step {} particle {} '.format(steps, part))
-            #print('max x coord: {} max y coord {} max z coord {}'.format((self.system.positions[part,0]),self.system.positions[part,1],self.system.positions[part,2]))
+            
+            if steps % outputInterval == 0:
+                """
+                mu/kT
+                U/(NkT)
+                """
+                chemPot =  np.log( self.ensembleChemicalPotential / self.system.natoms / self.totalWeight )
+                pressure = self.ensemblePressure / self.totalWeight
+                energy = self.ensembleEnergy / self.totalWeight / self.system.natoms
+                print('Step {} particle {} chem pot {:6.4} pressure {:6.4} energy/part {:6.4} LJ results are mu {:6.4} press {:6.4} energy {:6.4}'.
+                      format(steps, part, 
+                             chemPot+ self.system.ChemPotTailCorrection(),
+                             pressure + self.system.PressureTailCorrection(), 
+                              energy + (1.0/self.system.natoms) * self.system.EnergyTailCorrection() , 
+                             FreeEnergyLJ_res(self.system.temp, self.system.rho) ,
+                             PressureLJ(self.system.temp, self.system.rho),
+                             ULJ(self.system.temp, self.system.rho)   ) )
+                print('Energy tail correction: {} Pressure tail correction {} ChemPot tail correction {}'.format(
+                      self.system.EnergyTailCorrection(), self.system.PressureTailCorrection(),self.system.ChemPotTailCorrection()   ) )
+            self.Sample()
         #######################################################################   
     def UpdateMobilities(self):
         self.mobilities = self.CalculateParticleMobilities()
@@ -175,7 +232,8 @@ class KMC_NVT():
         """
         for i in range(self.system.natoms):
             self.rwEnergies, self.rwVirials = self.UpdateEnergies(i)
-                            
+            
+    """ given a maximum pair potential energy, find the corresponding distance"""                        
     def OverCut(self):
 
         self.overLapCut = FindOverLapCut(self.overLap,self.system.sig,
@@ -183,28 +241,32 @@ class KMC_NVT():
         self.overLapCut_sq = self.overLapCut ** 2
         
     def Sample(self):
-        raise NotImplementedError  
+        r = 0
+        while r == 0:
+            r = np.random.rand()
+        self.configWeight = 1.0 / self.totalMobility * np.log( 1.0 / r )
+        self.totalWeight += self.configWeight
+        self.configEnergy = np.sum(self.rwEnergies) / 2.0
+        self.configVirial = np.sum(self.rwVirials) / 2.0
+        self.configPressure = self.system.GetPressure(self.configVirial)
+        self.configChemicalPotential = self.totalMobility 
+        self.ensembleEnergy += self.configWeight * self.configEnergy
+        self.ensemblePressure += self.configWeight * self.configPressure
+        self.ensembleChemicalPotential += self.configWeight * self.configChemicalPotential
+                                 
         
 ###############################################################################        
     def CalculateParticleMobilities(self):
+        """Calls outside function because it is @njit"""
         natoms = self.system.natoms
         rwEnergies = self.rwEnergies
         beta = self.system.beta
-        return self.calculateParticleMobilities(natoms,rwEnergies, beta) # workaround to use @jit
+        return calculateParticleMobilities(natoms,rwEnergies, beta) # workaround to use @jit
         
-    #@staticmethod
-    #@nb.jit(nopython=True)
-    def calculateParticleMobilities(self, natoms,rwEnergies, beta):
-        
-        mobilities = np.zeros((natoms), dtype=np.float_)
-        
-        for i in range(natoms):
-            mobilities[i] = np.exp( beta * np.sum( rwEnergies[i,:]) )
-        #print('maximum mobility: {} minimum mobility: {} '.format(max(mobilities), min(mobilities)))    
-        return mobilities
 ############################################################################### 
 
     def UpdateEnergies(self,part):
+        """Calls outside function because it is @njit"""
         r = self.system.positions
         box = self.system.boxSize
         r_cut_box_sq = self.system.rCut_sq
@@ -213,35 +275,9 @@ class KMC_NVT():
         eps = self.system.eps
         sig = self.system.sig
         overlap_sq = self.overLapCut_sq
-        return self.updateEnergies(part, r, box, r_cut_box_sq,rwEnergies, rwVirials,
+        return updateEnergies(part, r, box, r_cut_box_sq,rwEnergies, rwVirials,
                        eps, sig, overlap_sq )
-        
-    def updateEnergies(self,part, r, box, r_cut_box_sq,energyMatrix, virialMatrix,
-                       eps, sig, overlap_sq = 0.75):
-        ri = r[part]
-        rsq = 0.0
-        """Calculate chosen particle's potential energy with rest of system """
-        """Save the pairwise energies in a matrix, same with virial contribution"""
-        for index, rj in enumerate(r):
-            if index == part: continue
-            rij = ri - rj            # Separation vector
-            rij = rij - np.rint(rij / box ) * box # Mirror Image Seperation
-    
-            rsq = np.dot(rij,rij)  # Squared separation
-            if rsq < r_cut_box_sq: # Check within cutoff
-                if rsq < overlap_sq: 
-                    rsq = overlap_sq
-    
-                sr2    = sig / rsq    # (sigma/rij)**2
-                sr6  = sr2 ** 3
-                sr12 = sr6 ** 2
-                pot  = 4 * eps * (sr12 - sr6)        # LJ pair potential (cut but not shifted)
-                vir  = pot + sr12                    # LJ pair virial
-                energyMatrix[part,index] = pot
-                energyMatrix[index,part] = pot
-                virialMatrix[part,index] = vir
-                virialMatrix[index,part] = vir
-        return energyMatrix, virialMatrix 
+
 ###############################################################################
    
     def MoveParticle(self,i):
@@ -257,8 +293,9 @@ class KMC_NVT():
         while True: 
             if ( zeta <= cumw ): break # 
             k += 1
-            if ( k > len( w ) ): 
+            if ( k >= len( w ) ): 
                 print("Welp, we messed up. Probably forgot to start indexing at 0 for pick_r()")
+                print(len(self.mobilities), np.sum(self.mobilities), cumw,self.totalMobility,zeta )
                 exit
 
             cumw += w[k]
@@ -272,10 +309,10 @@ class KMC_NVT():
 
 def LennardJones(rij, sigma, epsilon):
     sr = sigma / rij
-    return 4 * epsilon * ( ( sr )**12 - ( sr )**6  ) 
+    return 4.0 * epsilon * ( ( sr )**12 - ( sr )**6  ) 
     
 def FindOverLapCut(overLap,sig, eps, guess_rij = 0.8):
-    return scipy.optimize.fsolve(lambda x: overLap - LennardJones(x,sig, eps), guess_rij) 
+    return float(scipy.optimize.fsolve(lambda x: overLap - LennardJones(x,sig, eps), guess_rij)) 
 
 def PrintPDB(system,step, name=""):
     f = open(str(name) + "system_step_" + str(step) + ".pdb",'w') 
@@ -318,20 +355,12 @@ equilibrate = KMC_NVT(nEquilSteps,  overLap, phase1, "Equilibration")
 
 PrintPDB(equilibrate.system, equilibrate.nSteps,"equil_")
 
-production1  = KMC_NVT(100000,  overLap, equilibrate.system, "Production1")
+production1  = KMC_NVT(1000000,  overLap, equilibrate.system, "Production1")
 #production2  = KMC_NVT(1000,  overLap, production1.system, "Production2")
 
 PrintPDB(production1.system, production1.nSteps,"post_")
 print(np.sum(equilibrate.mobilities) )
+print(np.sum(production1.mobilities) )
 #print(equilibrate.rwEnergies)
 #print(equilibrate.rwVirials)
 print(phase1.rho)
-
-"""
-Notes - ToDo
-add viral pressure
-add tail corrections
-add sampling of chemical potential
-    sample weights
-    
-"""
