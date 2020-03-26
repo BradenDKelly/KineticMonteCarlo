@@ -1,0 +1,15 @@
+{
+"natoms":256,
+"nblock":100,
+"nstep":100,
+"temperature":1.2996,
+"rho":0.75,
+"epsilon":1.0,
+"sigma":1.0,
+"r_cut":2.5,
+"dr_max":0.15,
+"outputInterval":100,
+"initConf":"crystal",
+"overlap":100.0,
+"rNumSeed":111
+}
