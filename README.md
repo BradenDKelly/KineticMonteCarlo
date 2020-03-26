@@ -1,2 +1,3 @@
 # KineticMonteCarlo
-Simple python codes for kinetic monte carlo (currently out of order)
+Simple python codes for kinetic monte carlo
+
